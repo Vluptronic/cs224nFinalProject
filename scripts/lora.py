@@ -9,10 +9,14 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed, TrainingArguments, Trainer
 from peft import LoraConfig, get_peft_model, TaskType
 from huggingface_hub import login
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = lambda x, **kwargs: x
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LoRA fine-tuning and generated-answer EM/F1 evaluation on BioASQ.")
+    parser = argparse.ArgumentParser(description="LoRA BioASQ: answer-only loss + small generated EM/F1 eval.")
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--dataset_name", type=str, default="rag-datasets/rag-mini-bioasq")
     parser.add_argument("--dataset_config", type=str, default="question-answer-passages")
@@ -21,9 +25,6 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="/root/zhanhe/CS115BFP/outputs/lora_bioasq")
 
     parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--max_prompt_length", type=int, default=512)
-    parser.add_argument("--max_new_tokens", type=int, default=96)
-    parser.add_argument("--num_eval_examples", type=int, default=-1, help="-1 means evaluate all held-out examples after training.")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
 
@@ -31,6 +32,10 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+
+    parser.add_argument("--num_generation_eval_examples", type=int, default=50)
+    parser.add_argument("--max_prompt_length", type=int, default=512)
+    parser.add_argument("--max_new_tokens", type=int, default=64)
 
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     parser.add_argument("--local_files_only", action="store_true")
@@ -60,7 +65,7 @@ def normalize_answer_field(answer):
 
 
 def normalize_text(s):
-    s = s.lower()
+    s = str(s).lower()
     s = re.sub(r"\b(a|an|the)\b", " ", s)
     s = "".join(ch for ch in s if ch not in set(string.punctuation))
     s = " ".join(s.split())
@@ -97,7 +102,7 @@ def build_prompt(question):
 """
 
 
-def tokenize_example(example, tokenizer, max_length):
+def tokenize_for_loss(example, tokenizer, max_length):
     prompt = build_prompt(example["question"])
     target = normalize_answer_field(example["answer"]) + tokenizer.eos_token
     full_text = prompt + target
@@ -114,42 +119,54 @@ def tokenize_example(example, tokenizer, max_length):
 
 
 def generate_answer(model, tokenizer, prompt, device, max_prompt_length, max_new_tokens):
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_prompt_length).to(device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_prompt_length, padding=False).to(device)
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            num_beams=1,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
         )
     generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    return tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
 
 
 def evaluate_generation(model, tokenizer, eval_ds, device, args):
-    if args.num_eval_examples is not None and args.num_eval_examples > 0:
-        eval_ds = eval_ds.select(range(min(args.num_eval_examples, len(eval_ds))))
+    n = min(args.num_generation_eval_examples, len(eval_ds)) if args.num_generation_eval_examples > 0 else len(eval_ds)
+    small_eval = eval_ds.select(range(n))
 
     em_scores, f1_scores = [], []
-    examples_for_print = []
-
+    sample = None
     model.eval()
-    for ex in eval_ds:
+    for ex in tqdm(small_eval, desc="Generation eval"):
         question = ex["question"]
         gold = normalize_answer_field(ex["answer"])
         prompt = build_prompt(question)
         pred = generate_answer(model, tokenizer, prompt, device, args.max_prompt_length, args.max_new_tokens)
         em_scores.append(exact_match(pred, gold))
         f1_scores.append(token_f1(pred, gold))
-        if len(examples_for_print) < 1:
-            examples_for_print.append((question, gold, pred))
+        if sample is None:
+            sample = {"question": question, "gold": gold, "pred": pred}
 
     return {
-        "exact_match": sum(em_scores) / len(em_scores),
-        "token_f1": sum(f1_scores) / len(f1_scores),
-        "num_eval_examples": len(em_scores),
-    }, examples_for_print
+        "exact_match": sum(em_scores) / max(len(em_scores), 1),
+        "token_f1": sum(f1_scores) / max(len(f1_scores), 1),
+        "num_generation_eval_examples": len(em_scores),
+    }, sample
+
+
+def print_sample(sample):
+    if sample is None:
+        return
+    print("\nQualitative sample")
+    print("-" * 80)
+    print(f"Question: {sample['question']}")
+    print(f"Gold:     {sample['gold']}")
+    print(f"Pred:     {sample['pred']}")
+    print("-" * 80)
 
 
 def main():
@@ -159,8 +176,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = get_torch_dtype(args.dtype)
-
     print(f"Using device: {device}")
+
     ds = load_dataset(args.dataset_name, args.dataset_config)
     full_ds = ds[args.split].shuffle(seed=args.seed)
     split_ds = full_ds.train_test_split(test_size=args.test_size, seed=args.seed)
@@ -190,14 +207,8 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    tokenized_train = train_ds.map(
-        lambda ex: tokenize_example(ex, tokenizer, args.max_length),
-        remove_columns=train_ds.column_names,
-    )
-    tokenized_eval = eval_ds.map(
-        lambda ex: tokenize_example(ex, tokenizer, args.max_length),
-        remove_columns=eval_ds.column_names,
-    )
+    tokenized_train = train_ds.map(lambda ex: tokenize_for_loss(ex, tokenizer, args.max_length), remove_columns=train_ds.column_names)
+    tokenized_eval = eval_ds.map(lambda ex: tokenize_for_loss(ex, tokenizer, args.max_length), remove_columns=eval_ds.column_names)
     tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     tokenized_eval.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
@@ -219,25 +230,25 @@ def main():
     )
 
     trainer = Trainer(model=model, args=training_args, train_dataset=tokenized_train, eval_dataset=tokenized_eval)
-    trainer.train()
+    train_result = trainer.train()
+    eval_result = trainer.evaluate()
+    eval_loss = float(eval_result.get("eval_loss", float("nan")))
 
-    print("Running generated-answer evaluation on held-out split...")
-    metrics, examples = evaluate_generation(model, tokenizer, eval_ds, device, args)
+    # Turn cache back on for faster generation.
+    model.config.use_cache = True
+    print("Running small generated-answer evaluation on held-out split...")
+    metrics, sample = evaluate_generation(model, tokenizer, eval_ds, device, args)
 
-    print("=" * 60)
-    print("LoRA generated-answer evaluation")
-    print(f"Exact Match: {metrics['exact_match']:.4f}")
-    print(f"Token F1:    {metrics['token_f1']:.4f}")
-    print(f"N examples:   {metrics['num_eval_examples']}")
-    print("=" * 60)
-
-    for q, gold, pred in examples:
-        print("\nQualitative sample")
-        print("-" * 60)
-        print(f"Question: {q}")
-        print(f"Gold:     {gold}")
-        print(f"Pred:     {pred}")
-        print("-" * 60)
+    print("=" * 80)
+    print("LoRA evaluation")
+    print(f"Answer-only eval loss: {eval_loss:.4f}")
+    print(f"Generated Exact Match: {metrics['exact_match']:.4f}")
+    print(f"Generated Token F1:    {metrics['token_f1']:.4f}")
+    print(f"Generation eval N:     {metrics['num_generation_eval_examples']}")
+    print(f"Train metrics:         {train_result.metrics}")
+    print(f"Eval metrics:          {eval_result}")
+    print("=" * 80)
+    print_sample(sample)
 
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)

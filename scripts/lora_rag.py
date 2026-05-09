@@ -6,15 +6,20 @@ from collections import Counter
 
 import torch
 import lancedb
+from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from peft import PeftModel
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import login
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = lambda x, **kwargs: x
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LoRA + LanceDB RAG generated-answer EM/F1 evaluation on BioASQ.")
+    parser = argparse.ArgumentParser(description="LoRA + LanceDB RAG BioASQ: answer-only loss + small generated EM/F1 eval.")
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--lora_dir", type=str, default="/root/zhanhe/CS115BFP/outputs/lora_bioasq")
     parser.add_argument("--dataset_name", type=str, default="rag-datasets/rag-mini-bioasq")
@@ -31,9 +36,13 @@ def parse_args():
     parser.add_argument("--rebuild_index", action="store_true")
 
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_length", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=8)
+
+    parser.add_argument("--num_generation_eval_examples", type=int, default=50)
     parser.add_argument("--max_prompt_length", type=int, default=1024)
-    parser.add_argument("--max_new_tokens", type=int, default=96)
-    parser.add_argument("--num_eval_examples", type=int, default=-1, help="-1 means evaluate all held-out examples.")
+    parser.add_argument("--max_new_tokens", type=int, default=64)
+
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     parser.add_argument("--local_files_only", action="store_true")
     return parser.parse_args()
@@ -62,7 +71,7 @@ def normalize_answer_field(answer):
 
 
 def normalize_text(s):
-    s = s.lower()
+    s = str(s).lower()
     s = re.sub(r"\b(a|an|the)\b", " ", s)
     s = "".join(ch for ch in s if ch not in set(string.punctuation))
     s = " ".join(s.split())
@@ -106,7 +115,6 @@ def get_id_field(example):
 def build_or_load_lancedb(args, embedder):
     db = lancedb.connect(args.db_path)
     existing_tables = db.list_tables()
-
     if args.table_name in existing_tables and not args.rebuild_index:
         print(f"Opening existing LanceDB table: {args.table_name}")
         return db.open_table(args.table_name)
@@ -114,21 +122,16 @@ def build_or_load_lancedb(args, embedder):
     print("Building LanceDB index from BioASQ text corpus...")
     corpus_ds = load_dataset(args.dataset_name, args.corpus_config)
     corpus = corpus_ds[args.corpus_split]
-
     sample = corpus[0]
     text_field = get_text_field(sample)
     id_field = get_id_field(sample)
 
-    # Chunking strategy: dataset-provided full passage/sentence records. No custom splitting or overlap.
+    # Chunking strategy: use dataset-provided full passage/sentence rows; no custom splitting/overlap.
     texts = [str(ex[text_field]) for ex in corpus]
     ids = [str(ex[id_field]) for ex in corpus]
-
     embeddings = embedder.encode(texts, batch_size=64, normalize_embeddings=True, show_progress_bar=True)
 
-    rows = []
-    for passage_id, text, vector in zip(ids, texts, embeddings):
-        rows.append({"passage_id": passage_id, "text": text, "vector": vector.tolist()})
-
+    rows = [{"passage_id": pid, "text": txt, "vector": vec.tolist()} for pid, txt, vec in zip(ids, texts, embeddings)]
     table = db.create_table(args.table_name, data=rows, mode="overwrite")
     print(f"Created LanceDB table with {len(rows)} full-passage chunks.")
     return table
@@ -156,18 +159,66 @@ def build_rag_prompt(question, retrieved_passages):
 """
 
 
+def tokenize_for_loss(example, tokenizer, max_length, table, embedder, top_k):
+    retrieved_passages, retrieved_ids = retrieve_passages(example["question"], table, embedder, top_k)
+    prompt = build_rag_prompt(example["question"], retrieved_passages)
+    target = normalize_answer_field(example["answer"]) + tokenizer.eos_token
+    full_text = prompt + target
+
+    full = tokenizer(full_text, truncation=True, padding="max_length", max_length=max_length)
+    prompt_ids = tokenizer(prompt, truncation=True, max_length=max_length, padding=False)["input_ids"]
+
+    labels = full["input_ids"].copy()
+    prompt_len = len(prompt_ids)
+    labels[:prompt_len] = [-100] * prompt_len
+    labels = [-100 if tok == tokenizer.pad_token_id else lab for tok, lab in zip(full["input_ids"], labels)]
+    full["labels"] = labels
+    full["retrieved_passage_ids"] = retrieved_ids
+    return full
+
+
+def collate_fn(batch):
+    return {
+        "input_ids": torch.stack([x["input_ids"] for x in batch]),
+        "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
+        "labels": torch.stack([x["labels"] for x in batch]),
+    }
+
+
+def evaluate_loss(model, tokenizer, eval_ds, table, embedder, device, args):
+    tokenized_eval = eval_ds.map(
+        lambda ex: tokenize_for_loss(ex, tokenizer, args.max_length, table, embedder, args.top_k),
+        remove_columns=eval_ds.column_names,
+    )
+    tokenized_eval.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    loader = DataLoader(tokenized_eval, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+
+    total_loss = 0.0
+    num_batches = 0
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Loss eval"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            total_loss += float(outputs.loss.item())
+            num_batches += 1
+    return total_loss / max(num_batches, 1)
+
+
 def generate_answer(model, tokenizer, prompt, device, max_prompt_length, max_new_tokens):
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_prompt_length).to(device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_prompt_length, padding=False).to(device)
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            num_beams=1,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
         )
     generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    return tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
 
 
 def recall_hit(example, retrieved_ids):
@@ -181,37 +232,49 @@ def recall_hit(example, retrieved_ids):
 
 
 def evaluate_generation(model, tokenizer, eval_ds, table, embedder, device, args):
-    if args.num_eval_examples is not None and args.num_eval_examples > 0:
-        eval_ds = eval_ds.select(range(min(args.num_eval_examples, len(eval_ds))))
+    n = min(args.num_generation_eval_examples, len(eval_ds)) if args.num_generation_eval_examples > 0 else len(eval_ds)
+    small_eval = eval_ds.select(range(n))
 
     em_scores, f1_scores, recall_hits = [], [], []
-    examples_for_print = []
-
+    sample = None
     model.eval()
-    for ex in eval_ds:
+    for ex in tqdm(small_eval, desc="Generation eval"):
         question = ex["question"]
         gold = normalize_answer_field(ex["answer"])
         retrieved_passages, retrieved_ids = retrieve_passages(question, table, embedder, args.top_k)
         prompt = build_rag_prompt(question, retrieved_passages)
         pred = generate_answer(model, tokenizer, prompt, device, args.max_prompt_length, args.max_new_tokens)
-
         em_scores.append(exact_match(pred, gold))
         f1_scores.append(token_f1(pred, gold))
         hit = recall_hit(ex, retrieved_ids)
         if hit is not None:
             recall_hits.append(hit)
-
-        if len(examples_for_print) < 1:
-            examples_for_print.append((question, gold, pred, retrieved_passages, retrieved_ids))
+        if sample is None:
+            sample = {"question": question, "gold": gold, "pred": pred, "retrieved_ids": retrieved_ids, "retrieved_passages": retrieved_passages}
 
     metrics = {
-        "exact_match": sum(em_scores) / len(em_scores),
-        "token_f1": sum(f1_scores) / len(f1_scores),
-        "num_eval_examples": len(em_scores),
+        "exact_match": sum(em_scores) / max(len(em_scores), 1),
+        "token_f1": sum(f1_scores) / max(len(f1_scores), 1),
+        "num_generation_eval_examples": len(em_scores),
     }
     if recall_hits:
         metrics[f"recall_at_{args.top_k}"] = sum(recall_hits) / len(recall_hits)
-    return metrics, examples_for_print
+    return metrics, sample
+
+
+def print_sample(sample):
+    if sample is None:
+        return
+    print("\nQualitative sample")
+    print("-" * 80)
+    print(f"Question: {sample['question']}")
+    print(f"Gold:     {sample['gold']}")
+    print(f"Pred:     {sample['pred']}")
+    print(f"Retrieved IDs: {sample['retrieved_ids']}")
+    print("Retrieved passages:")
+    for i, p in enumerate(sample["retrieved_passages"], 1):
+        print(f"[{i}] {p[:700]}")
+    print("-" * 80)
 
 
 def main():
@@ -221,8 +284,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = get_torch_dtype(args.dtype)
-
     print(f"Using device: {device}")
+
     qa_ds = load_dataset(args.dataset_name, args.qa_config)
     full_ds = qa_ds[args.split].shuffle(seed=args.seed)
     split_ds = full_ds.train_test_split(test_size=args.test_size, seed=args.seed)
@@ -238,41 +301,31 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    print(f"Loading base model: {args.model_name}")
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch_dtype,
         local_files_only=args.local_files_only,
     ).to(device)
 
-    print(f"Loading LoRA adapter: {args.lora_dir}")
+    print(f"Loading LoRA adapter from: {args.lora_dir}")
     model = PeftModel.from_pretrained(base_model, args.lora_dir)
     model.to(device)
     model.eval()
 
-    metrics, examples = evaluate_generation(model, tokenizer, eval_ds, table, embedder, device, args)
+    eval_loss = evaluate_loss(model, tokenizer, eval_ds, table, embedder, device, args)
+    metrics, sample = evaluate_generation(model, tokenizer, eval_ds, table, embedder, device, args)
 
-    print("=" * 60)
-    print("LoRA + LanceDB RAG generated-answer evaluation")
-    print(f"Top-k:       {args.top_k}")
-    print(f"Exact Match: {metrics['exact_match']:.4f}")
-    print(f"Token F1:    {metrics['token_f1']:.4f}")
+    print("=" * 80)
+    print("LoRA + LanceDB RAG evaluation")
+    print(f"Top-k:                 {args.top_k}")
+    print(f"Answer-only eval loss: {eval_loss:.4f}")
+    print(f"Generated Exact Match: {metrics['exact_match']:.4f}")
+    print(f"Generated Token F1:    {metrics['token_f1']:.4f}")
     if f"recall_at_{args.top_k}" in metrics:
-        print(f"Recall@{args.top_k}:   {metrics[f'recall_at_{args.top_k}']:.4f}")
-    print(f"N examples:   {metrics['num_eval_examples']}")
-    print("=" * 60)
-
-    for q, gold, pred, passages, ids in examples:
-        print("\nQualitative sample")
-        print("-" * 60)
-        print(f"Question: {q}")
-        print(f"Gold:     {gold}")
-        print(f"Pred:     {pred}")
-        print(f"Retrieved IDs: {ids}")
-        print("Retrieved passages:")
-        for i, p in enumerate(passages, 1):
-            print(f"[{i}] {p[:700]}")
-        print("-" * 60)
+        print(f"Recall@{args.top_k}:             {metrics[f'recall_at_{args.top_k}']:.4f}")
+    print(f"Generation eval N:     {metrics['num_generation_eval_examples']}")
+    print("=" * 80)
+    print_sample(sample)
 
 
 if __name__ == "__main__":
